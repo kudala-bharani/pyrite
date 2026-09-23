@@ -382,7 +382,10 @@ def resolve_api_key_role(key: str | None, config: PyriteConfig) -> str | None:
     """Resolve an API key to its role (read/write/admin).
 
     Returns:
-        - "admin" when auth is disabled (no api_key and no api_keys)
+        - "admin" when no keys are configured and auth is disabled (open access)
+        - None when no keys are configured and auth is enabled: no key is
+          valid, so the caller falls through to its session or the anonymous
+          tier (any key used to answer "admin" here)
         - "admin" when key matches the legacy single api_key
         - The configured role when key hash matches an api_keys entry
         - None when key is invalid or missing (auth enabled but key wrong)
@@ -392,9 +395,10 @@ def resolve_api_key_role(key: str | None, config: PyriteConfig) -> str | None:
     has_single_key = bool(config.settings.api_key)
     has_key_list = bool(config.settings.api_keys)
 
-    # No auth configured → everyone is admin
+    # No keys configured: open access only when auth is also disabled.
+    # With auth enabled there is no valid key, so any key is refused.
     if not has_single_key and not has_key_list:
-        return "admin"
+        return None if config.settings.auth.enabled else "admin"
 
     if not key:
         return None
@@ -687,12 +691,54 @@ async def resolve_effective_kb_role(
     if not kb_name:
         return role
 
-    kb_default_role = resolve_kb_default_role(config, db, kb_name)
+    return effective_kb_role_for_user(config, db, auth_user["id"], kb_name)
+
+
+def effective_kb_role_for_user(
+    config: PyriteConfig, db: PyriteDB, user_id: int | None, kb_name: str, auth_service=None
+) -> str | None:
+    """The per-KB role rule, framework-free: grant → KB default_role → global role.
+
+    The one implementation. `resolve_effective_kb_role` (REST's per-KB tier
+    check), `kbs_for_user_at_tier` (the readable and writable sets MCP and
+    `/ws` resolve per connection) all call it. `user_id=None` is the anonymous
+    visitor on an auth-enabled instance.
+    """
+    if auth_service is None:
+        from ..services.auth_service import AuthService
+
+        auth_service = AuthService(db, config.settings.auth)
+    default_role = resolve_kb_default_role(config, db, kb_name)
+    return auth_service.get_kb_role(user_id, kb_name, default_role)
+
+
+def kbs_for_user_at_tier(
+    config: PyriteConfig,
+    db: PyriteDB,
+    user_id: int | None,
+    role: str | None,
+    tier: str,
+    *,
+    scoped: bool = True,
+) -> set[str] | None:
+    """The KBs where the caller's effective role is at least `tier`, or None
+    when the caller is not scoped (a global admin, an operator API key, auth
+    disabled). See `readable_kbs_for_user` for the scoping rules; this is the
+    same walk at any tier, so the read and write sets cannot drift apart.
+    """
+    if role == "admin" or not scoped:
+        return None
 
     from ..services.auth_service import AuthService
 
     auth_service = AuthService(db, config.settings.auth)
-    return auth_service.get_kb_role(auth_user["id"], kb_name, kb_default_role)
+    wanted = TIER_LEVELS[tier]
+    result: set[str] = set()
+    for kb in config.all_kbs():
+        effective = effective_kb_role_for_user(config, db, user_id, kb.name, auth_service)
+        if effective is not None and TIER_LEVELS.get(effective, -1) >= wanted:
+            result.add(kb.name)
+    return result
 
 
 def readable_kbs_for_user(
@@ -723,19 +769,7 @@ def readable_kbs_for_user(
     `user_id=None` with `scoped=True` is the anonymous visitor on an
     auth-enabled instance: the same walk with no grants.
     """
-    if role == "admin" or not scoped:
-        return None
-
-    from ..services.auth_service import AuthService
-
-    auth_service = AuthService(db, config.settings.auth)
-    result: set[str] = set()
-    for kb in config.all_kbs():
-        default_role = resolve_kb_default_role(config, db, kb.name)
-        effective = auth_service.get_kb_role(user_id, kb.name, default_role)
-        if effective is not None and TIER_LEVELS.get(effective, -1) >= TIER_LEVELS["read"]:
-            result.add(kb.name)
-    return result
+    return kbs_for_user_at_tier(config, db, user_id, role, "read", scoped=scoped)
 
 
 async def readable_kbs(request: Request, config: PyriteConfig, db: PyriteDB) -> set[str] | None:
@@ -1175,7 +1209,10 @@ def create_app(config: PyriteConfig | None = None) -> FastAPI:
     # MCP SSE transport (mounted outside /api — handles its own Bearer auth)
     from .mcp_routes import mount_mcp_routes
 
-    mount_mcp_routes(application, _app_get_config, _app_get_db)
+    # The shared PyriteDB, not the `_app_get_db` generator dependency: the MCP
+    # routes are plain Starlette handlers, so no DI runs the generator; they
+    # open their own per-request handle (#131) around the auth lookup.
+    mount_mcp_routes(application, _app_get_config, _app_db)
 
     # Collect endpoint routers under /api with auth + read-tier baseline
     api_router = APIRouter(
@@ -1204,9 +1241,43 @@ def create_app(config: PyriteConfig | None = None) -> FastAPI:
     # WebSocket endpoint for multi-tab awareness
     @application.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket):
-        from .websocket import manager
+        """Authenticate the handshake, then register the socket with its scope.
 
-        await manager.connect(ws)
+        Rejected handshakes are closed *before* ``accept`` and never reach the
+        manager (#218). The readable set is fixed for the connection's life.
+        The resolution runs on a worker thread with its own short-lived DB
+        handle -- not a ``Depends(get_db)`` session, which would stay open for
+        as long as the socket does.
+        """
+        from starlette.concurrency import run_in_threadpool
+
+        from .websocket import HandshakeRejectedError, manager, origin_allowed, resolve_socket_scope
+
+        cfg = application.state.pyrite_config
+        if not origin_allowed(ws, cfg):
+            # Logged: behind a proxy that rewrites Host, this is the only
+            # trace of why the web UI's socket never connects.
+            logger.warning(
+                "Refused /ws handshake: Origin %r is neither this server's Host %r "
+                "nor listed in cors_origins",
+                ws.headers.get("origin"),
+                ws.headers.get("host"),
+            )
+            await ws.close(code=1008)
+            return
+
+        def _resolve() -> set[str] | None:
+            with _app_db().request_handle() as db:
+                return resolve_socket_scope(ws, cfg, db)
+
+        try:
+            readable = await run_in_threadpool(_resolve)
+        except HandshakeRejectedError:
+            logger.info("Refused /ws handshake: no credential admits this socket")
+            await ws.close(code=1008)
+            return
+
+        await manager.connect(ws, readable)
         try:
             while True:
                 # Keep connection alive; clients can send pings

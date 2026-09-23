@@ -195,7 +195,6 @@ READABLE_KBS_KWARG = "readable_kbs"
 # inventory with a reason apiece.
 NON_KB_CONTENT_TOOLS = frozenset(
     {
-        "kb_stats",  # index-wide counts, as REST's /api/stats
         "kb_index_job_status",  # background job state, keyed by job id
         "kb_registry_remove",  # admin: registration, not content
         "kb_registry_reindex",
@@ -365,8 +364,17 @@ class PyriteMCPServer:
             registry.set_context(ctx)
 
             plugin_tools = registry.get_all_mcp_tools(self.tier)
-            for name in plugin_tools:
-                self._tool_tiers[name] = self.tier
+            # Plugins return every tool up to the tier asked for, so a tool's
+            # own tier is the lowest one that returns it. Labelling them all
+            # with the server's tier would make a plugin's read tools look
+            # like writes to the per-KB write check and the rate limiter.
+            lower: set[str] = set()
+            for tier in self.VALID_TIERS[: self.VALID_TIERS.index(self.tier) + 1]:
+                at_tier = plugin_tools if tier == self.tier else registry.get_all_mcp_tools(tier)
+                for name in at_tier:
+                    if name not in lower and name in plugin_tools:
+                        self._tool_tiers[name] = tier
+                lower.update(at_tier)
             self.tools.update(plugin_tools)
         except Exception:
             logger.warning("Plugin MCP tool loading failed", exc_info=True)
@@ -656,10 +664,15 @@ class PyriteMCPServer:
             "tags": tags,
         }
 
-    def _kb_stats(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Get index statistics."""
-        stats = self.index_mgr.get_index_stats()
-        return stats
+    def _kb_stats(
+        self, args: dict[str, Any], *, readable_kbs: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Get index statistics over the KBs the caller may read.
+
+        As REST's /api/stats: the per-KB map and every total are computed
+        from the readable set; `None` (unscoped) is the whole index.
+        """
+        return self.index_mgr.get_index_stats(kb_names=readable_kbs)
 
     def _kb_schema(self, args: dict[str, Any]) -> dict[str, Any]:
         """Get KB schema for agent discoverability."""
@@ -1519,6 +1532,7 @@ class PyriteMCPServer:
             priority=args.get("priority", 5),
             assignee=args.get("assignee", ""),
             dependencies=args.get("dependencies"),
+            tags=args.get("tags"),
         )
 
     def _task_update(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2168,6 +2182,7 @@ class PyriteMCPServer:
         *,
         client_id: str = "local",
         readable_kbs: set[str] | None = None,
+        writable_kbs: set[str] | None = None,
     ) -> dict[str, Any]:
         """Execute a tool and return result.
 
@@ -2181,6 +2196,13 @@ class PyriteMCPServer:
         is where scoping is enforced: refuse any KB the call names that the
         caller may not read, then hand the set to the cross-KB handlers that
         declare they take it.
+
+        `writable_kbs` is the caller's writable set (`api.kbs_for_user_at_tier`
+        at "write" -- REST's per-KB write rule). It applies only when the
+        caller is scoped (`readable_kbs` is not None); a scoped caller with
+        no writable set resolved is treated as able to write nowhere. A tool
+        registered above the read tier runs only when every KB it names is
+        writable, and never when it names none.
         """
         if name not in self.tools:
             return _error(
@@ -2231,6 +2253,25 @@ class PyriteMCPServer:
                 suggestion="Name a knowledge base you can read, or use kb_search",
             )
 
+        # Per-KB write check: the REST `requires_kb_tier("write")` rule, over
+        # the set resolved from the same helper. Keyed off the tool's
+        # registered tier, so every write tool -- core or plugin -- is covered
+        # by construction rather than by enumeration. After the fail-closed
+        # read check above, so a scoped call naming no KB keeps that refusal.
+        if readable_kbs is not None and self._tool_tiers.get(name, "read") != "read":
+            writable = writable_kbs or set()
+            if not named_kbs:
+                return _error(
+                    "FORBIDDEN",
+                    f"Tool '{name}' writes to a knowledge base; name one you can write",
+                )
+            for kb_name in named_kbs:
+                if kb_name not in writable:
+                    return _error(
+                        "FORBIDDEN",
+                        f"Insufficient permissions on KB '{kb_name}': requires 'write' tier",
+                    )
+
         # ADR-0034 rule 2: a truncated body is never valid input to a write.
         # The check sits here rather than in each handler so that it covers
         # every write tool -- kb_create, kb_update, task_create and any plugin
@@ -2261,7 +2302,13 @@ class PyriteMCPServer:
             logger.exception("Tool %s failed with args %s", name, arguments)
             return _error("INTERNAL", str(e), retryable=True)
 
-    def build_sdk_server(self, *, client_id: str = "stdio", readable_kbs: set[str] | None = None):
+    def build_sdk_server(
+        self,
+        *,
+        client_id: str = "stdio",
+        readable_kbs: set[str] | None = None,
+        writable_kbs: set[str] | None = None,
+    ):
         """Build an mcp.server.Server wired to this instance's business logic.
 
         Called **per connection**, and it constructs a fresh
@@ -2285,6 +2332,11 @@ class PyriteMCPServer:
             admin, an operator API key, auth disabled -- and is the default,
             so `run_stdio()` (local CLI, one user, their own machine) is
             unchanged.
+        writable_kbs : set[str] | None
+            The KBs a write-tier tool may target for this caller, as resolved
+            by `api.kbs_for_user_at_tier(..., "write")`. Consulted only when
+            `readable_kbs` is not None; a scoped connection without it can
+            write nowhere.
         """
         from mcp.server import Server
         from mcp.types import (
@@ -2305,6 +2357,7 @@ class PyriteMCPServer:
         mcp_server = self  # capture for closures
         _client_id = client_id  # capture for closures
         _readable_kbs = readable_kbs  # capture for closures -- per connection, never on self
+        _writable_kbs = writable_kbs
 
         @sdk.list_tools()
         async def _list_tools():
@@ -2320,7 +2373,11 @@ class PyriteMCPServer:
         @sdk.call_tool()
         async def _call_tool(name: str, arguments: dict):
             result = mcp_server._dispatch_tool(
-                name, arguments or {}, client_id=_client_id, readable_kbs=_readable_kbs
+                name,
+                arguments or {},
+                client_id=_client_id,
+                readable_kbs=_readable_kbs,
+                writable_kbs=_writable_kbs,
             )
             return [
                 TextContent(

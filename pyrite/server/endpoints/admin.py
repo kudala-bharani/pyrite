@@ -7,7 +7,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from ...config import PyriteConfig
 from ...exceptions import ConfigError, KBNotFoundError, KBProtectedError
 from ...services.auth_service import AuthService
-from ...services.ephemeral_service import EphemeralKBService
+from ...services.ephemeral_service import EphemeralKBService, InvalidEphemeralKBNameError
 from ...services.index_worker import IndexWorker
 from ...services.kb_registry_service import KBRegistryService
 from ...services.llm_service import LLMService
@@ -23,6 +23,7 @@ from ..api import (
     get_kb_registry,
     get_llm_service,
     get_llm_usage_service,
+    get_readable_kbs,
     limiter,
     requires_tier,
     resolve_kb_default_role,
@@ -41,9 +42,13 @@ router = APIRouter(tags=["Admin"])
 
 @router.get("/stats", response_model=StatsResponse)
 @limiter.limit("100/minute")
-def get_stats(request: Request, index_mgr: IndexManager = Depends(get_index_mgr)):
-    """Get index statistics."""
-    stats = index_mgr.get_index_stats()
+def get_stats(
+    request: Request,
+    index_mgr: IndexManager = Depends(get_index_mgr),
+    readable: set[str] | None = Depends(get_readable_kbs),
+):
+    """Get index statistics, over the KBs the caller may read."""
+    stats = index_mgr.get_index_stats(kb_names=readable)
     return StatsResponse(**stats)
 
 
@@ -217,7 +222,12 @@ def create_kb(
 ):
     """Create a new knowledge base."""
     if ephemeral:
-        kb = eph_svc.create_ephemeral_kb(name, ttl=ttl or 3600, description=description)
+        try:
+            kb = eph_svc.create_ephemeral_kb(name, ttl=ttl or 3600, description=description)
+        except InvalidEphemeralKBNameError as e:
+            raise HTTPException(
+                status_code=400, detail={"code": "INVALID_KB_NAME", "message": str(e)}
+            ) from None
         return {"created": True, "name": kb.name, "path": str(kb.path), "ephemeral": True}
 
     try:
@@ -345,6 +355,10 @@ def create_ephemeral_kb(
     auth_service = AuthService(db, config.settings.auth)
     try:
         result = auth_service.create_user_ephemeral_kb(auth_user["id"], eph_svc, name=name)
+    except InvalidEphemeralKBNameError as e:
+        raise HTTPException(
+            status_code=400, detail={"code": "INVALID_KB_NAME", "message": str(e)}
+        ) from None
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e))
 

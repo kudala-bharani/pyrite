@@ -34,7 +34,8 @@ with what covers it elsewhere: `/mcp` is a `Mount` (a whole
 sub-application) and `/ws` is a `WebSocketRoute`. Neither is a `FastAPI`
 route object with a dependant tree, so nothing *here* says anything about
 them. `/mcp` is now scoped and covered by its own pair of tests (#201);
-`/ws` is still unscoped and tracked as #218.
+`/ws` is now authenticated and scoped per socket, covered by
+`tests/test_websocket_scoping.py` (#218).
 
 **How scoping is detected: the dependency tree, not the handler body.**
 Every route's `route.dependant` is walked recursively and each
@@ -116,12 +117,15 @@ UNREACHABLE_BY_THIS_WALK = {
         "instead of a dependant tree). #201."
     ),
     "/ws": (
-        "WebSocketRoute. No dependant tree, and still NOT scoped. Checked "
-        "during #201 and filed as its own issue rather than widening that "
-        "one: broadcast_event fans (entry_id, kb_name) out to every connected "
-        "socket, so a private KB's *metadata* reaches callers who may not "
-        "read it. Strictly smaller than #201 (names, not entry bodies) and "
-        "unauthenticated besides. See #218."
+        "WebSocketRoute, so this walk still cannot see it -- but it is no "
+        "longer unreviewed. The handshake is authenticated with the same "
+        "credential resolver as /mcp (mcp_routes._resolve_credential) and a "
+        "cross-origin handshake is refused; each socket stores the readable "
+        "set from api.readable_kbs_for_user, resolved once at connect, and "
+        "ConnectionManager.broadcast sends an event naming a KB only to "
+        "sockets that may read it. What covers it: "
+        "tests/test_websocket_scoping.py (behavioural, real sockets over "
+        "TestClient, the private-KB event driven through POST /api/clip). #218."
     ),
 }
 
@@ -161,7 +165,6 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("POST", "/api/reviews"): "write route: requires_kb_tier('write') subsumes read",
     ("DELETE", "/api/reviews/{review_id}"): "write route: requires_kb_tier('write') subsumes read",
     # -- part 2: meta/admin surfaces ------------------------------------
-    ("GET", "/api/stats"): "part 2: admin.py -- index-wide counts, no per-KB scoping today",
     ("GET", "/api/plugins"): "part 2: admin.py",
     ("GET", "/api/plugins/{name}"): "part 2: admin.py",
     ("GET", "/api/ai/status"): "part 2: admin.py",
@@ -189,13 +192,8 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("GET", "/api/settings/{key}"): "part 2: settings_ep.py",
     ("PUT", "/api/settings/{key}"): "part 2: settings_ep.py",
     ("DELETE", "/api/settings/{key}"): "part 2: settings_ep.py",
-    ("GET", "/api/repos"): "part 2: repos.py -- open PR #161 touches it",
-    ("GET", "/api/repos/{name:path}"): "part 2: repos.py -- open PR #161 touches it",
-    ("DELETE", "/api/repos/{name:path}"): "part 2: repos.py -- open PR #161 touches it",
     ("POST", "/api/repos/fork"): "part 2: repos.py -- open PR #161 touches it",
     ("POST", "/api/repos/subscribe"): "part 2: repos.py -- open PR #161 touches it",
-    ("POST", "/api/repos/{name:path}/pr"): "part 2: repos.py -- open PR #161 touches it",
-    ("POST", "/api/repos/{name:path}/sync"): "part 2: repos.py -- open PR #161 touches it",
     ("GET", "/api/github/repos"): "part 2: repos.py -- GitHub account listing, not KB content",
     ("GET", "/api/worktree/status"): "part 2: worktree.py",
     ("GET", "/api/worktree/changes"): "part 2: worktree.py",
@@ -208,7 +206,6 @@ ALLOWLIST: dict[tuple[str, str], str] = {
     ("POST", "/api/kbs/{kb_name}/commit"): "part 2: git_ops.py",
     ("POST", "/api/kbs/{kb_name}/publish"): "part 2: git_ops.py",
     ("POST", "/api/kbs/{kb_name}/push"): "part 2: git_ops.py",
-    ("POST", "/api/kbs/{kb_name}/export"): "part 2: export route, kbs.py",
 }
 
 HOW_TO_FIX = """

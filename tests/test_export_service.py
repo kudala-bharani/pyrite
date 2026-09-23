@@ -220,6 +220,182 @@ class TestPathTraversalPrevention:
         assert len(files) == 1
         assert files[0].resolve().is_relative_to(target.resolve())
 
+    def test_entry_type_absolute_path_stays_inside_target(
+        self, export_svc, mock_config, mock_db, tmp_path
+    ):
+        """CodeQL #16: an entry_type that is an absolute path must not become
+        an absolute path join -- it must land inside target_dir."""
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        outside = tmp_path / "outside"
+        mock_db.list_entries.return_value = [
+            {
+                "id": "evil-entry",
+                "entry_type": str(outside),
+                "title": "Evil Entry",
+                "body": "pwned",
+                "tags": [],
+            }
+        ]
+
+        target = tmp_path / "export"
+        result = export_svc.export_kb_to_directory("test", target)
+
+        assert result["files_created"] == 1
+        # Nothing must be created at the absolute path the attacker supplied
+        assert not outside.exists()
+
+        # The file must exist inside target, under a sanitized type dir
+        written = list(target.rglob("*.md"))
+        assert len(written) == 1
+        assert written[0].resolve().is_relative_to(target.resolve())
+
+    def test_entry_type_traversal_stays_inside_target(
+        self, export_svc, mock_config, mock_db, tmp_path
+    ):
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        mock_db.list_entries.return_value = [
+            {
+                "id": "evil-entry",
+                "entry_type": "../../outside",
+                "title": "Evil Entry",
+                "body": "pwned",
+                "tags": [],
+            }
+        ]
+
+        target = tmp_path / "export"
+        result = export_svc.export_kb_to_directory("test", target)
+
+        assert result["files_created"] == 1
+        assert not (tmp_path / "outside").exists()
+
+        written = list(target.rglob("*.md"))
+        assert len(written) == 1
+        assert written[0].resolve().is_relative_to(target.resolve())
+
+    def test_normal_type_still_gets_own_subdir(self, export_svc, mock_config, mock_db, tmp_path):
+        """A normal plugin type name must still get its own, unchanged subdirectory."""
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        mock_db.list_entries.return_value = [
+            {
+                "id": "widget-1",
+                "entry_type": "cascade_event",
+                "title": "A Cascade Event",
+                "body": "content",
+                "tags": [],
+            }
+        ]
+
+        target = tmp_path / "export"
+        export_svc.export_kb_to_directory("test", target)
+
+        assert (target / "cascade_event" / "widget-1.md").exists()
+
+    def test_colliding_ids_produce_two_files(self, export_svc, mock_config, mock_db, tmp_path):
+        """Two distinct raw ids that sanitize to the same filename ("a/b" and
+        "a_b" both -> note/a_b.md) must not let one entry's export silently
+        overwrite the other's (#221 redispatch cold read)."""
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        mock_db.list_entries.return_value = [
+            {"id": "a/b", "entry_type": "note", "title": "One", "body": "one content", "tags": []},
+            {"id": "a_b", "entry_type": "note", "title": "Two", "body": "two content", "tags": []},
+        ]
+
+        target = tmp_path / "export"
+        result = export_svc.export_kb_to_directory("test", target)
+
+        assert result["entries_exported"] == 2
+        written = list((target / "note").glob("*.md"))
+        assert len(written) == 2
+        all_content = "\n".join(p.read_text() for p in written)
+        assert "one content" in all_content
+        assert "two content" in all_content
+
+    def test_colliding_types_produce_two_dirs(self, export_svc, mock_config, mock_db, tmp_path):
+        """Two distinct raw types that sanitize to the same directory
+        ("note" and "note_" both -> note/) must not let one type's export
+        silently overwrite the other's (#221 redispatch cold read)."""
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        mock_db.list_entries.return_value = [
+            {
+                "id": "real-note",
+                "entry_type": "note",
+                "title": "Real",
+                "body": "real content",
+                "tags": [],
+            },
+            {
+                "id": "evil-entry",
+                "entry_type": "note_",
+                "title": "Evil",
+                "body": "EVIL",
+                "tags": [],
+            },
+        ]
+
+        target = tmp_path / "export"
+        result = export_svc.export_kb_to_directory("test", target)
+
+        assert result["entries_exported"] == 2
+        written = list(target.rglob("*.md"))
+        assert len(written) == 2
+        all_content = "\n".join(p.read_text() for p in written)
+        assert "real content" in all_content
+        assert "EVIL" in all_content
+
+    def test_frontmatter_type_keeps_raw_value_when_type_is_malicious(
+        self, export_svc, mock_config, mock_db, tmp_path
+    ):
+        """The stored/exported frontmatter `type:` must keep the raw value --
+        only the directory name is sanitized."""
+        kb_cfg = MagicMock()
+        kb_cfg.kb_yaml_path = tmp_path / "kb.yaml"
+        kb_cfg.kb_yaml_path.write_text("name: test")
+        mock_config.get_kb.return_value = kb_cfg
+
+        raw_type = "../../outside"
+        mock_db.list_entries.return_value = [
+            {
+                "id": "evil-entry",
+                "entry_type": raw_type,
+                "title": "Evil Entry",
+                "body": "pwned",
+                "tags": [],
+            }
+        ]
+
+        target = tmp_path / "export"
+        export_svc.export_kb_to_directory("test", target)
+
+        written = list(target.rglob("*.md"))
+        assert len(written) == 1
+        content = written[0].read_text()
+        import yaml
+
+        parts = content.split("---")
+        fm = yaml.safe_load(parts[1])
+        assert fm["type"] == raw_type
+
 
 class TestPushKB:
     @patch("pyrite.services.git_service.GitService")

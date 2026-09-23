@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .models import KB
 
@@ -52,6 +52,32 @@ class KBOpsMixin:
             )
             self.session.add(kb)
         self.session.commit()
+
+    def insert_new_kb(
+        self,
+        name: str,
+        kb_type: str,
+        path: str,
+        description: str = "",
+        source: str = "user",
+    ) -> bool:
+        """Register a KB only if no row has this name; never overwrite one.
+
+        Returns False when the name is already registered. The primary key
+        makes this atomic: of two concurrent inserts, one fails.
+        """
+        type_str = kb_type.value if hasattr(kb_type, "value") else kb_type
+        if self.session.get(KB, name) is not None:
+            return False
+        self.session.add(
+            KB(name=name, kb_type=type_str, path=path, description=description, source=source)
+        )
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            return False
+        return True
 
     def merge_registered_kbs(self, config: "PyriteConfig") -> int:
         """Merge DB-registered KBs (from ``pyrite kb add``) into ``config``.
@@ -109,11 +135,21 @@ class KBOpsMixin:
         return True
 
     def unregister_kb(self, name: str) -> None:
-        """Remove a KB and all its entries from the index."""
+        """Remove a KB, all its entries, and every per-KB grant on it.
+
+        The one place a KB is deleted -- registry removal (REST, MCP, CLI),
+        repo unsubscribe and ephemeral expiry all come through here -- so the
+        grants go here too. A `kb_permission` row outliving its KB is
+        inherited by the next KB registered under the same name. Deleted
+        even when the KB row is already gone, and in the same transaction.
+        """
         kb = self.session.get(KB, name)
         if kb:
             self.session.delete(kb)
-            self.session.commit()
+        self.session.execute(
+            text("DELETE FROM kb_permission WHERE kb_name = :kb_name"), {"kb_name": name}
+        )
+        self.session.commit()
 
     def get_kb_stats(self, name: str) -> dict[str, Any] | None:
         """Get statistics for a KB."""
@@ -131,8 +167,23 @@ class KBOpsMixin:
             return None
         return dict(row._mapping)
 
-    def get_type_counts(self, kb_name: str | None = None) -> list[dict[str, Any]]:
-        """Get entry counts grouped by entry_type."""
+    def get_type_counts(
+        self, kb_name: str | None = None, kb_names: set[str] | list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Get entry counts grouped by entry_type, restricted to ``kb_names`` when given."""
+        if kb_names is not None:
+            from .backends.base_backend import kb_names_clause
+
+            params: dict[str, Any] = {}
+            scope = kb_names_clause("kb_name", kb_names, params)
+            rows = self.session.execute(
+                text(
+                    f"SELECT entry_type, COUNT(*) as count FROM entry WHERE {scope} "
+                    "GROUP BY entry_type ORDER BY count DESC"
+                ),
+                params,
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
         if kb_name:
             rows = self.session.execute(
                 text(
