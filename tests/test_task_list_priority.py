@@ -1,6 +1,7 @@
 """Priority filtering for the task service and CLI (#309)."""
 
 import json
+import re
 
 import pytest
 from typer.testing import CliRunner
@@ -91,4 +92,4 @@ def test_cli_priority_filter(task_list_env, fmt, filters, expected):
 def test_task_list_help_includes_priority():
     result = runner.invoke(app, ["task", "list", "--help"])
     assert result.exit_code == 0, result.output
-    assert "--priority" in result.stdout
+    assert "--priority" in re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
